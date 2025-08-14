@@ -1,0 +1,21 @@
+ncls
+pretty_midi
+scipy
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.0+cu128
+torchaudio==2.7.0+cu128
+mir_eval
+pydub
+seaborn
+matplotlib
+tensorboard
+tqdm
+torch_optimizer
+sox
+soxr
+moduleconf
+audiomentations
+torch-log-wmse==0.3.0
+pyloudnorm
+einops
+pyroomacoustics

@@ -1,0 +1,8 @@
+[tool.ruff]
+line-length = 120
+
+[project]
+name = "transkun"
+version = "0.1.0"
+description = "Piano transcription and separation model"
+dependencies = []
