@@ -7,8 +7,8 @@ from .model import TransKun
 from .Data import (
     RandomizedCurriculumSNR,
     cosine_scale_skewed,
-    DatasetMaestro,
-    DatasetMaestroIterator,
+    Dataset,
+    DatasetIterator,
     collate_fn_batching,
     AugmentatorAudiomentations,
 )
@@ -142,7 +142,7 @@ def validate_mss(
             batch_weight = float(batch_seconds)
 
             # --- ロス ---
-            loss_spec, loss_wmse = model.log_prob(audio_slices, target_audio=target_audio)
+            loss_spec, loss_wmse = model.calc_loss(audio_slices, target_audio=target_audio)
             loss_recon = (loss_spec + loss_wmse * model.loss_wmse_weight) * loss_spec_weight
             total_loss = loss_recon
 
@@ -256,8 +256,8 @@ def train(worker_id: int, filename: str, run_seed: int, args):
     dataset_meta_train = args.datasetMetaFile_train
     dataset_meta_val = args.datasetMetaFile_val
 
-    dataset = DatasetMaestro(dataset_path, dataset_meta_train)
-    dataset_val = DatasetMaestro(dataset_path, dataset_meta_val)
+    dataset = Dataset(dataset_path, dataset_meta_train)
+    dataset_val = Dataset(dataset_path, dataset_meta_val)
 
     print(f"#{worker_id} loaded")
 
@@ -294,7 +294,7 @@ def train(worker_id: int, filename: str, run_seed: int, args):
 
     for epoch in range(start_epoch, 1000000):
         # イテレータ／ローダの組み立て
-        data_iter = DatasetMaestroIterator(
+        data_iter = DatasetIterator(
             dataset,
             hop_size,
             chunk_size,
@@ -336,7 +336,7 @@ def train(worker_id: int, filename: str, run_seed: int, args):
             target_audio = batch["target_audio"].to(device)
 
             # ロス計算
-            loss_spec, loss_wmse = model.log_prob(audio_slices, target_audio=target_audio)
+            loss_spec, loss_wmse = model.calc_loss(audio_slices, target_audio=target_audio)
             loss_recon = (loss_spec + loss_wmse * model.loss_wmse_weight) * loss_spec_weight
             total_loss = loss_recon
 
@@ -446,7 +446,7 @@ def train(worker_id: int, filename: str, run_seed: int, args):
         # ===== Validation (MSS only) =====
         torch.cuda.empty_cache()
 
-        data_iter_val = DatasetMaestroIterator(
+        data_iter_val = DatasetIterator(
             dataset_val,
             hopSizeInSecond=conf.segmentHopSizeInSecond,
             chunkSizeInSecond=chunk_size,

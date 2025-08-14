@@ -20,19 +20,18 @@ class ModelConfig:
         self.segmentSizeInSecond = 16
 
         # STFT / オーディオ設定
-        self.hopSize = 1024
-        self.windowSize = 2048
+        self.hop_length = 1024
+        self.window_size = 2048
         self.fs = 44100
         self.num_channels = 2
 
         # 特徴量/モデル設定
         self.num_bands = 60
-        self.baseSize = 64
-        self.nHead = 8
-        self.nLayers = 6
-        self.hiddenFactor = 4
-        self.scoringExpansionFactor = 4
-        self.contextDropoutProb = 0.1
+        self.hidden_size = 64
+        self.num_heads = 8
+        self.num_layers = 6
+        self.hidden_factor = 4
+        self.drop_prob = 0.1
         self.band_split_type = "bs"
 
         # ロス重み
@@ -130,8 +129,8 @@ class TransKun(nn.Module):
 
         # 基本設定
         self.fs = conf.fs
-        self.hop_size = conf.hopSize
-        self.window_size = conf.windowSize
+        self.hop_size = conf.hop_length
+        self.window_size = conf.window_size
         self.num_channels = conf.num_channels
         self.n_fft = self.window_size
 
@@ -145,14 +144,13 @@ class TransKun(nn.Module):
             sampling_rate=conf.fs,
             num_channels=conf.num_channels,
             n_fft=self.n_fft,
-            hop_size=conf.hopSize,
+            hop_size=conf.hop_length,
             n_bands=conf.num_bands,
-            hidden_size=conf.baseSize,
-            num_heads=conf.nHead,
-            ffn_hidden_size_factor=conf.hiddenFactor,
-            num_layers=conf.nLayers,
-            scoring_expansion_factor=conf.scoringExpansionFactor,
-            dropout=conf.contextDropoutProb,
+            hidden_size=conf.hidden_size,
+            num_heads=conf.num_heads,
+            ffn_hidden_size_factor=conf.hidden_factor,
+            num_layers=conf.num_layers,
+            dropout=conf.drop_prob,
             band_split_type=conf.band_split_type,
         )
 
@@ -295,7 +293,7 @@ class TransKun(nn.Module):
         return out_tnc
 
     # ---- 学習用ロス計算 ----
-    def log_prob(self, audio_slices: torch.Tensor, target_audio: torch.Tensor | None = None):
+    def calc_loss(self, audio_slices: torch.Tensor, target_audio: torch.Tensor | None = None):
         """
         MSS用のロスを返す。
         Args:

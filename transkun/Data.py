@@ -73,10 +73,6 @@ def read_audio_slice(audio_path: str, begin_sec: float, end_sec: float, normaliz
     return output, sample_rate
 
 
-# 後方互換（旧名）
-readAudioSlice = read_audio_slice  # noqa: N816 (互換目的)
-
-
 # ====== 音量正規化 / ミックス ======
 def loudness_normalize(wav: np.ndarray, sample_rate: int, target_lufs: float = -14.0) -> np.ndarray:
     if wav.size == 0 or not np.any(wav):
@@ -189,7 +185,7 @@ class RandomizedCurriculumSNR:
 
 
 # ====== データセット ======
-class DatasetMaestro:
+class Dataset:
     """
     初期化時に pickle を一周して、必要な軽量情報だけ保持。
     学習ループ中は pickle を再読込しない（高速化 & I/O削減）。
@@ -266,9 +262,6 @@ class DatasetMaestro:
 
         return target_audio, other_slice, sample_rate
 
-    # 後方互換（旧名）
-    fetchData = fetch_data  # noqa: N816 (互換目的)
-
 
 class AugmentatorAudiomentations:
     def __init__(
@@ -332,34 +325,25 @@ class AugmentatorAudiomentations:
 
 
 # ====== イテレータ ======
-class DatasetMaestroIterator(torch.utils.data.Dataset):
+class DatasetIterator(torch.utils.data.Dataset):
     def __init__(
         self,
-        dataset: DatasetMaestro,
+        dataset: Dataset,
         hop_size_in_second: float,
         chunk_size_in_second: float,
         step_counter: Optional[mp.Value] = None,
         snr_scheduler: Optional[Callable[[int], float]] = None,
         audio_normalize: bool = True,
-        notesStrictlyContained: bool = True,  # 互換のため残す（未使用）
         dithering_frames: bool = True,
         seed: int = 1234,
         augmentator: Optional[Callable[[np.ndarray], np.ndarray]] = None,
         cross_mix_prob: float = 0.25,
-        **legacy_kwargs,
     ):
         """
         cross_mix_prob: 同一曲の other ではなく、別曲の other を使う確率。
         legacy_kwargs: 旧シグネチャ (hopSizeInSecond, chunkSizeInSecond, audioNormalize, ditheringFrames など) を許容。
         """
         super().__init__()
-
-        # 旧キーワードを取り込み（あれば優先）
-        hop_size_in_second = float(legacy_kwargs.get("hopSizeInSecond", hop_size_in_second))
-        chunk_size_in_second = float(legacy_kwargs.get("chunkSizeInSecond", chunk_size_in_second))
-        audio_normalize = bool(legacy_kwargs.get("audioNormalize", audio_normalize))
-        dithering_frames = bool(legacy_kwargs.get("ditheringFrames", dithering_frames))
-
         self.dataset = dataset
         self.hop_size_in_second = float(hop_size_in_second)
         self.chunk_size_in_second = float(chunk_size_in_second)

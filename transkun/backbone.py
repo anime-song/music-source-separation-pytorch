@@ -6,10 +6,13 @@ import torch.utils.checkpoint
 import numpy as np
 import librosa
 import einops
-from .utils import checkpointByPass
 from .transformer import TransformerLayer, RMSNorm
 
 from typing import List, Tuple
+
+
+def checkpoint_bypass(f, *args):
+    return f(*args)
 
 
 def build_mel_band_indices(
@@ -269,7 +272,6 @@ class Backbone(nn.Module):
         n_bands: int,
         hidden_size: int,
         num_heads: int,
-        scoring_expansion_factor: int = 1,
         ffn_hidden_size_factor: int = 2,
         dropout: float = 0.0,
         num_layers: int = 4,
@@ -421,7 +423,7 @@ class Backbone(nn.Module):
         if self.use_gradient_checkpoint or self.training:
             checkpoint = torch.utils.checkpoint.checkpoint
         else:
-            checkpoint = checkpointByPass
+            checkpoint = checkpoint_bypass
 
         istft_length = x.shape[-1]
         x, original_spec_complex = self.to_spectrogram(x)  # x: [B, C*S, T, F]
