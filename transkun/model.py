@@ -270,7 +270,7 @@ class TransKun(nn.Module):
 
             seg_tc = seg_ct.transpose(0, 1).unsqueeze(0)  # [1, T, C]
             est_btnc = self.separate(seg_tc)  # [1, T, N, C]
-            est_nct = est_btnc[0].permute(1, 3, 0, 2).squeeze(2)  # [N, C, T]
+            est_nct = est_btnc[0].permute(1, 2, 0).contiguous()  # [T, N, C] → [N, C, T]
 
             seg_out_len = est_nct.shape[-1]
             end_idx = min(i + seg_out_len, total_length)
