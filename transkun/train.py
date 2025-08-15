@@ -5,8 +5,6 @@ from torch.utils.tensorboard import SummaryWriter
 import torch
 from .model import TransKun
 from .Data import (
-    RandomizedCurriculumSNR,
-    cosine_scale_skewed,
     Dataset,
     DatasetIterator,
     collate_fn_batching,
@@ -265,18 +263,6 @@ def train(worker_id: int, filename: str, run_seed: int, args):
         writer = SummaryWriter(filename + ".log")
 
     global_step_int = start_iter
-    global_step_mp = mp.Value("i", start_iter)
-
-    # SNR カリキュラム（そのまま利用可）
-    snr_scheduler = RandomizedCurriculumSNR(
-        min_snr=-14.0,
-        max_snr=-6.0,
-        max_step=args.nIter,
-        min_spread=6,
-        max_spread=6,
-        center_anneal=partial(cosine_scale_skewed, gamma=0.6),
-    )
-
     # ハイパーパラメータ
     batch_size = args.batch_size
     loss_spec_weight = conf.loss_spec_weight
@@ -294,16 +280,7 @@ def train(worker_id: int, filename: str, run_seed: int, args):
 
     for epoch in range(start_epoch, 1000000):
         # イテレータ／ローダの組み立て
-        data_iter = DatasetIterator(
-            dataset,
-            hop_size,
-            chunk_size,
-            step_counter=global_step_mp,
-            seed=epoch * 100 + run_seed,
-            augmentator=augmentator,
-            snr_scheduler=snr_scheduler,
-            notesStrictlyContained=False,
-        )
+        data_iter = DatasetIterator(dataset, hop_size, chunk_size, seed=epoch * 100 + run_seed, augmentator=augmentator)
 
         dataloader = torch.utils.data.DataLoader(
             data_iter,
@@ -348,8 +325,6 @@ def train(worker_id: int, filename: str, run_seed: int, args):
             grad_norm_history.step(float(total_grad_norm.item()))
 
             optimizer.step()
-            with global_step_mp.get_lock():
-                global_step_mp.value += 1
 
             try:
                 if global_step_int > global_step_warmup_cutoff:
@@ -387,7 +362,6 @@ def train(worker_id: int, filename: str, run_seed: int, args):
                 writer.add_scalar("Loss/train_loss_wmse", loss_wmse.item(), global_step_int)
                 writer.add_scalar("Optimizer/gradNorm", total_grad_norm.item(), global_step_int)
                 writer.add_scalar("Optimizer/clipValue", current_clip_value, global_step_int)
-                writer.add_scalar("Scheduler/center_snr", snr_scheduler.center_at(global_step_int), global_step_int)
 
                 compute_train_metrics = (args.trainMetricInterval > 0) and (batch_index % args.trainMetricInterval == 0)
                 if worker_id == 0 and compute_train_metrics:
@@ -450,7 +424,6 @@ def train(worker_id: int, filename: str, run_seed: int, args):
             dataset_val,
             hopSizeInSecond=conf.segmentHopSizeInSecond,
             chunkSizeInSecond=chunk_size,
-            notesStrictlyContained=False,
             seed=run_seed + epoch * 100,
         )
         dataloader_val = torch.utils.data.DataLoader(
@@ -506,7 +479,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataLoaderWorkers", default=2, type=int)
     parser.add_argument("--gradClippingQuantile", default=0.8, type=float)
 
-    parser.add_argument("--max_lr", default=1e-5, type=float)
+    parser.add_argument("--max_lr", default=1e-4, type=float)
     parser.add_argument("--weight_decay", default=1e-4, type=float)
     parser.add_argument("--nIter", default=500000, type=int)
     parser.add_argument("--modelConf", required=True, help="the path to the model conf file")

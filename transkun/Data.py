@@ -127,63 +127,6 @@ def mix_at_snr(
     return mixture, signal, noise
 
 
-# ====== SNRカリキュラム ======
-def build_anneal_fn(name_or_fn: str | Callable[[float], float]) -> Callable[[float], float]:
-    if callable(name_or_fn):
-        return name_or_fn
-    if name_or_fn == "linear":
-        return lambda ratio: 1.0 - ratio
-    if name_or_fn == "cosine":
-        return lambda ratio: (1.0 + math.cos(math.pi * ratio)) / 2.0
-    raise ValueError("anneal must be 'linear', 'cosine', or Callable")
-
-
-def cosine_scale_skewed(progress_ratio: float, gamma: float) -> float:
-    progress_ratio = float(np.clip(progress_ratio, 0.0, 1.0))
-    return (1.0 + math.cos(math.pi * (progress_ratio ** float(gamma)))) / 2.0
-
-
-class RandomizedCurriculumSNR:
-    """
-    center と spread を段階的に変化させつつ、各 step で一様乱数をサンプリング。
-    """
-
-    def __init__(
-        self,
-        min_snr: float,
-        max_snr: float,
-        max_step: int,
-        min_spread: float,
-        max_spread: float,
-        center_anneal: str | Callable[[float], float] = "linear",
-        spread_anneal: str | Callable[[float], float] = "linear",
-        rng: Optional[random.Random] = None,
-    ) -> None:
-        self.min_snr = float(min_snr)
-        self.max_snr = float(max_snr)
-        self.max_step = int(max_step)
-        self.min_spread = float(min_spread)
-        self.max_spread = float(max_spread)
-        self._center_anneal_fn = build_anneal_fn(center_anneal)
-        self._spread_anneal_fn = build_anneal_fn(spread_anneal)
-        self.rng = rng if rng is not None else random.Random()
-
-    def center_at(self, step: int) -> float:
-        ratio = min(step / self.max_step, 1.0)
-        scale = self._center_anneal_fn(ratio)
-        return self.min_snr + scale * (self.max_snr - self.min_snr)
-
-    def spread_at(self, step: int) -> float:
-        ratio = min(step / self.max_step, 1.0)
-        scale = self._spread_anneal_fn(ratio)
-        return self.min_spread + scale * (self.max_spread - self.min_spread)
-
-    def __call__(self, step: int) -> float:
-        center = self.center_at(step)
-        spread = self.spread_at(step)
-        return center + self.rng.uniform(-spread, +spread)
-
-
 # ====== データセット ======
 class Dataset:
     """
@@ -331,8 +274,6 @@ class DatasetIterator(torch.utils.data.Dataset):
         dataset: Dataset,
         hop_size_in_second: float,
         chunk_size_in_second: float,
-        step_counter: Optional[mp.Value] = None,
-        snr_scheduler: Optional[Callable[[int], float]] = None,
         audio_normalize: bool = True,
         dithering_frames: bool = True,
         seed: int = 1234,
@@ -347,8 +288,6 @@ class DatasetIterator(torch.utils.data.Dataset):
         self.dataset = dataset
         self.hop_size_in_second = float(hop_size_in_second)
         self.chunk_size_in_second = float(chunk_size_in_second)
-        self.step_counter = step_counter
-        self.snr_scheduler = snr_scheduler
         self.audio_normalize = audio_normalize
         self.dithering_frames = dithering_frames
         self.augmentator = augmentator
@@ -379,13 +318,6 @@ class DatasetIterator(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return len(self.chunks_all)
 
-    def _current_snr_db(self) -> float:
-        if self.snr_scheduler is None or self.step_counter is None:
-            return 0.0
-        with self.step_counter.get_lock():
-            step = int(self.step_counter.value)
-        return float(self.snr_scheduler(step))
-
     def __getitem__(self, index: int):
         if index < 0 or index >= len(self):
             raise IndexError
@@ -411,12 +343,11 @@ class DatasetIterator(torch.utils.data.Dataset):
             other_end=other_end,
         )
 
-        # Augmentation は target のみ（必要なら other にも適用してOK）
         if self.augmentator is not None:
             target_audio = self.augmentator(target_audio)
 
         # ラウドネス & ミックス
-        snr_db = self._current_snr_db()
+        snr_db = np.random.uniform(-20, -12)
         target_audio = loudness_normalize(target_audio, sample_rate)
         other_slice = loudness_normalize(other_slice, sample_rate)
         mixture, target_scaled, other_scaled = mix_at_snr(target_audio, other_slice, snr_db)
