@@ -1,6 +1,6 @@
 import math
 import numpy as np
-from typing import List, Optional
+from typing import List, Optional, Tuple, Dict
 
 import torch
 import torch.nn as nn
@@ -33,6 +33,7 @@ class ModelConfig:
         self.hidden_factor = 4
         self.drop_prob = 0.1
         self.band_split_type = "bs"
+        self.use_mixture_consistency = False
 
         # ロス重み
         self.loss_spec_weight = 1.0  # （トレーナ側で使用）
@@ -48,73 +49,70 @@ Config = ModelConfig
 # ============================
 #   Multi-Resolution STFT Loss
 # ============================
-@torch.no_grad()
-def _stft_ref(target: torch.Tensor, n_fft: int, hop_length: int, win_length: int, window: torch.Tensor):
-    return torch.stft(target, n_fft, hop_length, win_length, window=window, return_complex=True)
+def _stft(audio: torch.Tensor, n_fft: int, hop: int, win: torch.Tensor) -> torch.Tensor:
+    return torch.stft(audio, n_fft=n_fft, hop_length=hop, win_length=win.numel(), window=win, return_complex=True)
 
 
-def _stft_l1(
-    recon: torch.Tensor,
-    target: torch.Tensor,
-    n_fft: int,
-    hop_length: int,
-    win_length: int,
-    window: torch.Tensor,
+def _mrstft_sc_logmag(
+    recon: torch.Tensor, target: torch.Tensor, n_fft: int, hop: int, win: torch.Tensor, eps: float = 1e-7
 ) -> torch.Tensor:
-    """1解像度分のL1損失。checkpoint対応のため引数はTensor化。"""
-    spec_hat = torch.stft(
-        recon, int(n_fft.item()), int(hop_length.item()), int(win_length.item()), window=window, return_complex=True
-    )
+    """
+    1解像度ぶんの MR-STFT: Spectral Convergence + Log-Magnitude L1
+    recon/target: [B, T]
+    """
+    spec_hat = _stft(recon, n_fft, hop, win)
     with torch.no_grad():
-        spec_ref = torch.stft(
-            target,
-            int(n_fft.item()),
-            int(hop_length.item()),
-            int(win_length.item()),
-            window=window,
-            return_complex=True,
-        )
-    return F.l1_loss(spec_hat, spec_ref)
+        spec_ref = _stft(target, n_fft, hop, win)
+
+    mag_hat = torch.abs(spec_hat)
+    mag_ref = torch.abs(spec_ref)
+
+    # Spectral Convergence（振幅正規化）
+    num = torch.linalg.vector_norm(mag_hat - mag_ref)
+    den = torch.linalg.vector_norm(mag_ref) + eps
+    loss_sc = num / den
+
+    # Log-magnitude L1（広いダイナミクスで安定）
+    loss_log = F.l1_loss(torch.log(mag_hat + eps), torch.log(mag_ref + eps))
+
+    return loss_sc + loss_log
 
 
-def multi_resolution_stft_loss(
+def multi_resolution_stft_loss_amplitude_invariant(
     recon_audio: torch.Tensor,  # [B, C, N, T]
     target_audio: torch.Tensor,  # [B, C, N, T]
     resolutions: List[int] = [4096, 2048, 1024, 512, 256],
-    window_fn=torch.hann_window,
-    loss_weight: float = 1.0,
-    stem_weights: Optional[List[float]] = None,
     hop_length: int = 147,
+    window_fn=torch.hann_window,
+    stem_weights: Optional[List[float]] = None,
+    loss_weight: float = 1.0,
 ) -> torch.Tensor:
     b, c, n, t = recon_audio.shape
+    device, dtype = recon_audio.device, recon_audio.dtype
+
     if stem_weights is None:
         stem_weights = [1.0] * n
-    stem_weights_t = torch.as_tensor(stem_weights, device=recon_audio.device, dtype=recon_audio.dtype)
-    weight_sum = stem_weights_t.sum()
+    stem_w = torch.tensor(stem_weights, device=device, dtype=dtype)
+    w_sum = stem_w.sum().clamp_min(1e-8)
 
-    total_loss = recon_audio.new_tensor(0.0)
-    hop_list = [hop_length for r in resolutions]
+    # 各winをキャッシュ（再生成を避ける）
+    win_cache = {wl: window_fn(wl, device=device, dtype=dtype) for wl in resolutions}
 
-    for stem in range(n):
-        w_stem = stem_weights_t[stem]
+    total = recon_audio.new_tensor(0.0)
+    for stem_idx in range(n):
+        w_stem = stem_w[stem_idx]
         for ch in range(c):
-            recon = recon_audio[:, ch, stem].reshape(b, t)  # [B, T]
-            target = target_audio[:, ch, stem].reshape(b, t)  # [B, T]
-            for win_len, hop_length in zip(resolutions, hop_list):
-                window = window_fn(win_len, device=recon.device, dtype=recon.dtype)
+            recon_bt = recon_audio[:, ch, stem_idx].reshape(b, t)
+            target_bt = target_audio[:, ch, stem_idx].reshape(b, t)
+            for wl in resolutions:
+                win = win_cache[wl]
+                # checkpoint対応（メモリ節約）
                 loss_i = torch.utils.checkpoint.checkpoint(
-                    _stft_l1,
-                    recon,
-                    target,
-                    torch.tensor(win_len),
-                    torch.tensor(hop_length),
-                    torch.tensor(win_len),
-                    window,
-                    use_reentrant=False,
+                    _mrstft_sc_logmag, recon_bt, target_bt, wl, hop_length, win, use_reentrant=False
                 )
-                total_loss = total_loss + w_stem * loss_i
+                total = total + w_stem * loss_i
 
-    return (total_loss / (c * weight_sum)) * loss_weight
+    return (total / (c * w_sum)) * loss_weight
 
 
 # ============================
@@ -139,6 +137,8 @@ class TransKun(nn.Module):
         self.loss_wmse_weight = conf.loss_wmse_weight
         self.stem_weights = getattr(conf, "stem_weights", [1.0, 1.0])
 
+        print("use_mixture_consistency:", conf.use_mixture_consistency)
+
         # バックボーン
         self.backbone = Backbone(
             sampling_rate=conf.fs,
@@ -152,6 +152,7 @@ class TransKun(nn.Module):
             num_layers=conf.num_layers,
             dropout=conf.drop_prob,
             band_split_type=conf.band_split_type,
+            use_mixture_consistency=conf.use_mixture_consistency,
         )
 
     # ---- ユーティリティ ----
@@ -201,96 +202,120 @@ class TransKun(nn.Module):
         return_numpy: bool = False,
     ) -> torch.Tensor | np.ndarray:
         """
-        長尺オーディオを Overlap-Add で分離するユーティリティ。
+        長尺オーディオを Overlap-Add で分離するユーティリティ（固定仕様版）。
+        - 推論前処理: 入力ミックスを LUFS -14 に「1回だけ」正規化（pyloudnorm/BS.1770）
+        - 推論後処理: 出力ステムすべてに逆ゲインを掛け、元の音量へ復元
+        - 3者（mixture/target/other）で共通係数のため SNR は不変
 
         Args:
-            audio: [T, C] もしくは [C, T]、モノラルなら [T]
+            audio: [T, C] / [C, T] / [T]（float推奨）
             step_in_second: セグメントのホップ長（秒）。未指定時は conf.segmentHopSizeInSecond
             segment_size_in_second: セグメント長（秒）。未指定時は conf.segmentSizeInSecond
-            use_hann: True なら重み付けに Hann 窓（※ step < segment のとき推奨）。
-            return_numpy: True のとき numpy で返す。
-
+            use_hann: True なら OLA の重み付けに Hann 窓
+            return_numpy: True のとき numpy で返す
         Returns:
             estimates: [T, N(=2), C]
         """
-        device = self.getDevice()
 
-        # ---- 形状の正規化 ----
-        x = audio
-        if isinstance(x, np.ndarray):
-            x = torch.from_numpy(x)
-        if not torch.is_floating_point(x):
-            x = x.float()
-        if x.ndim == 1:
-            x = x[:, None]  # [T,1]
-        # [C,T] を検知して [T,C] に揃える（C は 1 or 2 を想定）
-        if x.shape[0] in (1, 2) and x.shape[1] > x.shape[0]:
-            # ただし [T,C] で T < C というケースは稀なのでこの判定で十分
-            x = x.transpose(0, 1)
-        x = x.to(device)
+        # -------- 入力を numpy [T, C] にそろえる（まだGPUに載せない）--------
+        def to_numpy_time_channel(x: torch.Tensor | np.ndarray) -> np.ndarray:
+            if isinstance(x, torch.Tensor):
+                x = x.detach().cpu().float().numpy()
+            else:
+                if not np.issubdtype(x.dtype, np.floating):
+                    x = x.astype(np.float32)
+            if x.ndim == 1:
+                x = x[:, None]  # [T, 1]
+            # [C, T] 形式の可能性に配慮（通常は T のほうが長い）
+            if x.shape[0] in (1, 2) and x.shape[1] > x.shape[0]:
+                x = x.T
+            return x.astype(np.float32, copy=False)
+
+        audio_tc_np = to_numpy_time_channel(audio)
+        sample_rate = self.fs
+
+        # -------- 前処理: LUFS -14 へ 1回だけ正規化（係数を保持）--------
+        try:
+            import pyloudnorm as pyln
+        except Exception as exc:
+            raise RuntimeError("推論時の LUFS 正規化には pyloudnorm が必要です（pip install pyloudnorm）。") from exc
+
+        loudness_meter = pyln.Meter(sample_rate)
+        mono_for_meter = audio_tc_np.mean(axis=1)
+        measured_lufs = float(loudness_meter.integrated_loudness(mono_for_meter))
+
+        if np.isfinite(measured_lufs):
+            gain_db = -14.0 - measured_lufs
+            gain_linear = float(10.0 ** (gain_db / 20.0))
+        else:
+            # 無音などで LUFS が計算不能な場合はゲイン=1.0
+            gain_linear = 1.0
+
+        audio_tc_np = (audio_tc_np * gain_linear).astype(np.float32, copy=False)
+
+        device = self.getDevice()
+        audio_tc = torch.from_numpy(audio_tc_np).to(device)  # [T, C]
+        audio_ct = audio_tc.transpose(0, 1)  # [C, T]
 
         if step_in_second is None:
             step_in_second = self.conf.segmentHopSizeInSecond
         if segment_size_in_second is None:
             segment_size_in_second = self.conf.segmentSizeInSecond
 
-        fs = self.fs
-        segment_size = int(math.ceil(segment_size_in_second * fs))
-        # hop_size の整数倍に丸める（位相整合のため）
-        step_size = int(math.ceil(step_in_second * fs / self.hop_size) * self.hop_size)
+        hop_size = self.hop_size
+        segment_size = int(math.ceil(segment_size_in_second * sample_rate))
+        step_size = int(math.ceil(step_in_second * sample_rate / hop_size) * hop_size)
         pad_samples = max(segment_size - step_size, 0)
 
-        # 時間次元にパディング（両側）
-        x_ct = x.transpose(0, 1)  # [C,T]
         if pad_samples > 0:
-            x_ct = F.pad(x_ct, (pad_samples, pad_samples))
-        total_length = x_ct.shape[-1]
+            audio_ct = F.pad(audio_ct, (pad_samples, pad_samples))
+        total_length = audio_ct.shape[-1]
 
-        # 出力バッファ [N,C,T]
-        recon = torch.zeros(self.num_stems, self.num_channels, total_length, device=device, dtype=x_ct.dtype)
-        win_buf = torch.zeros_like(recon)
+        estimates_nct = torch.zeros(
+            self.num_stems, self.num_channels, total_length, device=device, dtype=audio_ct.dtype
+        )
+        window_sum_nct = torch.zeros_like(estimates_nct)
 
-        # 窓（step >= segment の場合は矩形にフォールバック）
-        use_rect = step_size >= segment_size
-        if use_rect or not use_hann:
-            window_1d = torch.ones(segment_size, device=device, dtype=x_ct.dtype)
+        use_rect_window = step_size >= segment_size
+        if use_rect_window or not use_hann:
+            window_1d = torch.ones(segment_size, device=device, dtype=audio_ct.dtype)
         else:
-            window_1d = torch.hann_window(segment_size, device=device, dtype=x_ct.dtype)
-        window = window_1d[None, None, :]  # [1,1,L]
+            window_1d = torch.hann_window(segment_size, device=device, dtype=audio_ct.dtype)
+        window_nct = window_1d[None, None, :]  # [1, 1, L]
 
-        # ---- OLA ループ ----
-        for i in range(0, total_length, step_size):
-            j = min(i + segment_size, total_length)
-            seg_ct = x_ct[:, i:j]  # [C, L]
-            cur_len = seg_ct.shape[-1]
-            if cur_len < segment_size:
-                seg_ct = F.pad(seg_ct, (0, segment_size - cur_len))
+        for start_idx in range(0, total_length, step_size):
+            end_idx = min(start_idx + segment_size, total_length)
+            segment_ct = audio_ct[:, start_idx:end_idx]  # [C, L]
+            current_len = segment_ct.shape[-1]
+            if current_len < segment_size:
+                segment_ct = F.pad(segment_ct, (0, segment_size - current_len))
 
-            seg_tc = seg_ct.transpose(0, 1).unsqueeze(0)  # [1, T, C]
-            est_btnc = self.separate(seg_tc)  # [1, T, N, C]
-            est_nct = est_btnc[0].permute(1, 2, 0).contiguous()  # [T, N, C] → [N, C, T]
+            segment_tc = segment_ct.transpose(0, 1).unsqueeze(0)  # [1, T, C]
+            estimates_btnc = self.separate(segment_tc)  # [1, T, N, C]
+            estimates_seg_nct = estimates_btnc[0].permute(1, 2, 0)  # [N, C, T]
 
-            seg_out_len = est_nct.shape[-1]
-            end_idx = min(i + seg_out_len, total_length)
-            valid = end_idx - i
-            win = window[..., :seg_out_len]
+            valid_len = end_idx - start_idx
+            win = window_nct[..., : estimates_seg_nct.shape[-1]]
+            estimates_nct[..., start_idx:end_idx] += estimates_seg_nct[..., :valid_len] * win[..., :valid_len]
+            window_sum_nct[..., start_idx:end_idx] += win[..., :valid_len]
 
-            recon[..., i:end_idx] += est_nct[..., :valid] * win[..., :valid]
-            win_buf[..., i:end_idx] += win[..., :valid]
+        valid_mask = window_sum_nct > 0
+        estimates_nct[valid_mask] = estimates_nct[valid_mask] / window_sum_nct[valid_mask]
 
-        # 正規化（0割回避）
-        mask = win_buf > 0
-        recon[mask] = recon[mask] / win_buf[mask]
-
-        # パディング除去
         if pad_samples > 0:
-            recon = recon[..., pad_samples:-pad_samples]
+            estimates_nct = estimates_nct[..., pad_samples:-pad_samples]
 
-        # [N,C,T] -> [T,N,C]
-        out_tnc = recon.permute(2, 0, 1).contiguous()
+        # -------- 後処理: 逆ゲインで元音量に復元（全ステム同一係数）--------
+        if gain_linear != 1.0:
+            inverse_gain = 1.0 / gain_linear
+            estimates_nct = estimates_nct * inverse_gain
+
+        # [N, C, T] -> [T, N, C]
+        outputs_tnc = estimates_nct.permute(2, 0, 1).contiguous()
+
         if return_numpy:
-            return out_tnc.detach().cpu().numpy()
-        return out_tnc
+            return outputs_tnc.detach().cpu().numpy()
+        return outputs_tnc
 
     # ---- 学習用ロス計算 ----
     def calc_loss(self, audio_slices: torch.Tensor, target_audio: torch.Tensor | None = None):
@@ -317,10 +342,8 @@ class TransKun(nn.Module):
             recon_bcnT = recon_bcnT[..., :t_len]
 
             # Spec L1
-            loss_spec = multi_resolution_stft_loss(
-                recon_audio=recon_bcnT,
-                target_audio=target_bcnT,
-                stem_weights=self.stem_weights
+            loss_spec = multi_resolution_stft_loss_amplitude_invariant(
+                recon_audio=recon_bcnT, target_audio=target_bcnT, stem_weights=self.stem_weights
             )
 
             # Log-WMSE（波形系）

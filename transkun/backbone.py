@@ -278,6 +278,7 @@ class Backbone(nn.Module):
         use_gradient_checkpoint=True,
         num_stems: int = 2,
         band_split_type: str = "bs",
+        use_mixture_consistency: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -289,6 +290,7 @@ class Backbone(nn.Module):
         self.sampling_rate = sampling_rate
         self.hop_size = hop_size
         self.num_stems = num_stems
+        self.use_mixture_consistency = use_mixture_consistency
 
         self.num_windows = 0
 
@@ -402,11 +404,14 @@ class Backbone(nn.Module):
         source_estimates = original_spec_complex[:, :, None] * mask
 
         # mixture consistency
-        magnitude = source_estimates.abs().clamp_min(1e-8)
-        weights = magnitude**2
-        separated_spectrogram = self.mixture_consistency_projection(
-            source_estimates=source_estimates, mixture=original_spec_complex, weights=weights
-        )
+        if self.use_mixture_consistency:
+            magnitude = source_estimates.abs().clamp_min(1e-8)
+            weights = magnitude**2
+            separated_spectrogram = self.mixture_consistency_projection(
+                source_estimates=source_estimates, mixture=original_spec_complex, weights=weights
+            )
+        else:
+            separated_spectrogram = source_estimates
 
         separated_spectrogram = einops.rearrange(separated_spectrogram, "b c n f t -> (b c n) f t")
         recon_audio = torch.istft(

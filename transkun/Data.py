@@ -127,6 +127,73 @@ def mix_at_snr(
     return mixture, signal, noise
 
 
+def post_normalize_loudness(
+    mixture: np.ndarray,
+    signal_scaled: np.ndarray,
+    noise_scaled: np.ndarray,
+    sample_rate: int,
+    target_lufs: float = -24.0,
+    max_gain_db: float = 12.0,  # ゲイン上限（過大増幅抑止）
+    lufs_floor: float = -60.0,  # これ未満はLUFS無効扱い（無音/超小音）
+    use_peak_fallback: bool = True,
+    target_peak: float = 0.89,  # フォールバック時の目標ピーク（≈ -1 dBFS）
+    min_peak_for_gain: float = 1e-4,  # 無音時の過大増幅回避
+):
+    """
+    LUFSでポスト正規化。LUFSが非有限や極端に小さい場合はピーク正規化へフォールバック。
+    3者（mixture/signal_scaled/noise_scaled）へ同一係数を適用（SNRは不変）。
+    """
+
+    def clean_finite(x: np.ndarray) -> np.ndarray:
+        # NaN/±Inf を 0 に置換（計測と乗算の双方を安定化）
+        return np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+
+    # 入力健全化
+    mixture = clean_finite(mixture)
+    signal_scaled = clean_finite(signal_scaled)
+    noise_scaled = clean_finite(noise_scaled)
+
+    meter = pyln.Meter(sample_rate)
+
+    # チャンネル平均でLUFS測定用に単一系列へ
+    mix_mono = mixture if mixture.ndim == 1 else mixture.mean(axis=1)
+    mix_mono = clean_finite(mix_mono).astype(np.float32, copy=False)
+
+    # LUFS測定（失敗は -inf 扱い）
+    try:
+        current_lufs = float(meter.integrated_loudness(mix_mono))
+    except Exception:
+        current_lufs = float("-inf")
+
+    gain_lin: float
+
+    # LUFSが非有限 or 極端に小さいならフォールバック or スキップ
+    if (not np.isfinite(current_lufs)) or (current_lufs < lufs_floor):
+        if use_peak_fallback:
+            current_peak = float(np.max(np.abs(mixture)))
+            safe_peak = max(current_peak, float(min_peak_for_gain))
+            gain_lin = float(target_peak / safe_peak)
+        else:
+            gain_lin = 1.0
+    else:
+        raw_gain_db = target_lufs - current_lufs
+        gain_db = float(np.clip(raw_gain_db, -max_gain_db, max_gain_db))
+        gain_lin = float(10.0 ** (gain_db / 20.0))
+
+    if (not np.isfinite(gain_lin)) or (gain_lin <= 0.0):
+        gain_lin = 1.0
+
+    mixture_out = (mixture * gain_lin).astype(np.float32, copy=False)
+    signal_out = (signal_scaled * gain_lin).astype(np.float32, copy=False)
+    noise_out = (noise_scaled * gain_lin).astype(np.float32, copy=False)
+
+    mixture_out = clean_finite(mixture_out)
+    signal_out = clean_finite(signal_out)
+    noise_out = clean_finite(noise_out)
+
+    return mixture_out, signal_out, noise_out
+
+
 # ====== データセット ======
 class Dataset:
     """
@@ -351,6 +418,10 @@ class DatasetIterator(torch.utils.data.Dataset):
         target_audio = loudness_normalize(target_audio, sample_rate)
         other_slice = loudness_normalize(other_slice, sample_rate)
         mixture, target_scaled, other_scaled = mix_at_snr(target_audio, other_slice, snr_db)
+
+        mixture, target_scaled, other_scaled = post_normalize_loudness(
+            mixture, target_scaled, other_scaled, sample_rate, target_lufs=-14.0
+        )
 
         # 形状を常に [T, 2, C] に統一
         if target_scaled.ndim == 1:
