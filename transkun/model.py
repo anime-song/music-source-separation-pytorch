@@ -80,11 +80,11 @@ def _stft_l1(
 def multi_resolution_stft_loss(
     recon_audio: torch.Tensor,  # [B, C, N, T]
     target_audio: torch.Tensor,  # [B, C, N, T]
-    resolutions: List[int] = [32, 64, 128, 256, 512, 1024, 2048],
+    resolutions: List[int] = [4096, 2048, 1024, 512, 256],
     window_fn=torch.hann_window,
     loss_weight: float = 1.0,
     stem_weights: Optional[List[float]] = None,
-    hop_divisor: int = 4,
+    hop_length: int = 147,
 ) -> torch.Tensor:
     b, c, n, t = recon_audio.shape
     if stem_weights is None:
@@ -93,7 +93,7 @@ def multi_resolution_stft_loss(
     weight_sum = stem_weights_t.sum()
 
     total_loss = recon_audio.new_tensor(0.0)
-    hop_list = [r // hop_divisor for r in resolutions]
+    hop_list = [hop_length for r in resolutions]
 
     for stem in range(n):
         w_stem = stem_weights_t[stem]
@@ -320,8 +320,7 @@ class TransKun(nn.Module):
             loss_spec = multi_resolution_stft_loss(
                 recon_audio=recon_bcnT,
                 target_audio=target_bcnT,
-                stem_weights=self.stem_weights,
-                hop_divisor=4,
+                stem_weights=self.stem_weights
             )
 
             # Log-WMSE（波形系）
