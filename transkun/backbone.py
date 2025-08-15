@@ -290,7 +290,10 @@ class Backbone(nn.Module):
         self.hop_size = hop_size
         self.num_stems = num_stems
 
-        self.gaussian_windows = GaussianWindows(num_windows=5, window_size=self.window_size)
+        self.num_windows = 0
+
+        if self.num_windows > 0:
+            self.gaussian_windows = GaussianWindows(num_windows=5, window_size=self.window_size)
         self.register_buffer("hann_window", torch.hann_window(self.window_size))
 
         if band_split_type == "bs":
@@ -305,7 +308,7 @@ class Backbone(nn.Module):
             hidden_size=hidden_size,
             band_indices=self.band_indices,
             num_channels=self.num_channels,
-            extra_windows=self.gaussian_windows.num_windows,
+            extra_windows=self.num_windows,
         )
 
         self.encoder_layers = nn.ModuleList(
@@ -351,7 +354,8 @@ class Backbone(nn.Module):
         inputs = einops.rearrange(inputs, "b c t -> (b c) t")
 
         windows: list[torch.Tensor] = [self.hann_window]
-        windows.extend(self.gaussian_windows())
+        if self.num_windows > 0:
+            windows.extend(self.gaussian_windows())
 
         spectrograms = []
         for win in windows:
@@ -439,7 +443,7 @@ class Backbone(nn.Module):
         # 音源分離マスク
         mask_list = []
         for mask_estimator in self.mask_estimators:
-            pred_mask = checkpoint(mask_estimator, x[:, :, : self.num_bands], use_reentrant=False)  # [B, T, C*S, F]
+            pred_mask = checkpoint(mask_estimator, x, use_reentrant=False)  # [B, T, C*S, F]
             pred_mask = einops.rearrange(pred_mask, "b t (c s) f -> b t c f s", s=2).contiguous()
             pred_mask = torch.view_as_complex(pred_mask)  # [B, T, C, F]
             mask_list.append(pred_mask)
