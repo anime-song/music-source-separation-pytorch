@@ -14,8 +14,7 @@ import copy
 import time
 import numpy as np
 import math
-import multiprocessing as mp
-from functools import partial
+from pathlib import Path
 
 from .train_utils import *
 import argparse
@@ -253,6 +252,7 @@ def train(worker_id: int, filename: str, run_seed: int, args):
     dataset_path = args.datasetPath
     dataset_meta_train = args.datasetMetaFile_train
     dataset_meta_val = args.datasetMetaFile_val
+    snr_values_path = args.snr_values_path
 
     dataset = Dataset(dataset_path, dataset_meta_train)
     dataset_val = Dataset(dataset_path, dataset_meta_val)
@@ -280,7 +280,14 @@ def train(worker_id: int, filename: str, run_seed: int, args):
 
     for epoch in range(start_epoch, 1000000):
         # イテレータ／ローダの組み立て
-        data_iter = DatasetIterator(dataset, hop_size, chunk_size, seed=epoch * 100 + run_seed, augmentator=augmentator)
+        data_iter = DatasetIterator(
+            dataset,
+            hop_size,
+            chunk_size,
+            seed=epoch * 100 + run_seed,
+            augmentator=augmentator,
+            snr_values_path=snr_values_path,
+        )
 
         dataloader = torch.utils.data.DataLoader(
             data_iter,
@@ -425,6 +432,7 @@ def train(worker_id: int, filename: str, run_seed: int, args):
             hopSizeInSecond=conf.segmentHopSizeInSecond,
             chunkSizeInSecond=chunk_size,
             seed=run_seed + epoch * 100,
+            snr_values_path=snr_values_path,
         )
         dataloader_val = torch.utils.data.DataLoader(
             data_iter_val,
@@ -492,6 +500,7 @@ if __name__ == "__main__":
         type=int,
         help="training中にSNRを算出してログする間隔（ステップ）。0で無効。",
     )
+    parser.add_argument("--snr_values_path", type=Path, default=None)
 
     args = parser.parse_args()
     saved_filename = args.saved_filename

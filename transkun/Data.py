@@ -194,6 +194,38 @@ def post_normalize_loudness(
     return mixture_out, signal_out, noise_out
 
 
+def load_snr_values_db(npy_path: str) -> np.ndarray:
+    """values_filtered.npy を読み込んで有限値のみ抽出。"""
+    snr_values_db = np.load(npy_path).astype(np.float64)
+    snr_values_db = snr_values_db[np.isfinite(snr_values_db)]
+    if snr_values_db.size == 0:
+        raise ValueError("SNR 配列が空または全て非有限値です。")
+    return snr_values_db
+
+
+def make_empirical_resampler(
+    snr_values_db: np.ndarray,
+    random_state: int | None = None,
+):
+    """
+    実測値そのものから再標本化するサンプラー。
+    """
+    rng = np.random.default_rng(random_state)
+    values = np.array(snr_values_db, dtype=np.float64)
+
+    def sample_snr_db(n: int = 1, jitter_std_db: float = 0.5) -> np.ndarray:
+        """
+        n 個の SNR[dB] を返す。必要なら微小ジッタを加える。
+        jitter_std_db 例: 0.1（= 標準偏差 0.1 dB）
+        """
+        samples = rng.choice(values, size=n, replace=True)
+        if jitter_std_db > 0:
+            samples = samples + rng.normal(0.0, jitter_std_db, size=n)
+        return samples
+
+    return sample_snr_db
+
+
 # ====== データセット ======
 class Dataset:
     """
@@ -346,6 +378,7 @@ class DatasetIterator(torch.utils.data.Dataset):
         seed: int = 1234,
         augmentator: Optional[Callable[[np.ndarray], np.ndarray]] = None,
         cross_mix_prob: float = 0.25,
+        snr_values_path: Path = None,
     ):
         """
         cross_mix_prob: 同一曲の other ではなく、別曲の other を使う確率。
@@ -359,6 +392,11 @@ class DatasetIterator(torch.utils.data.Dataset):
         self.dithering_frames = dithering_frames
         self.augmentator = augmentator
         self.cross_mix_prob = float(cross_mix_prob)
+
+        if snr_values_path is not None:
+            self.snr_values = load_snr_values_db(snr_values_path.resolve())
+            self.snr_sampler = make_empirical_resampler(snr_values_db=self.snr_values)
+            print("Enable Empirical SNR Sample:", snr_values_path)
 
         random_generator = random.Random(seed)
 
@@ -414,7 +452,10 @@ class DatasetIterator(torch.utils.data.Dataset):
             target_audio = self.augmentator(target_audio)
 
         # ラウドネス & ミックス
-        snr_db = np.random.uniform(-20, -12)
+        if self.snr_sampler is not None:
+            snr_db = self.snr_sampler()
+        else:
+            snr_db = np.random.uniform(-15, 0)
         target_audio = loudness_normalize(target_audio, sample_rate)
         other_slice = loudness_normalize(other_slice, sample_rate)
         mixture, target_scaled, other_scaled = mix_at_snr(target_audio, other_slice, snr_db)
